@@ -56,3 +56,61 @@ python main.py step3              # first default pair
 python main.py step3 GLD SLV      # explicit pair
 ```
 
+## Step 4 — Backtest design
+
+The backtest uses explicit time splits and walk-forward recalibration:
+
+- Train / pair calibration: `2018-2021`
+- Validation / tuning: `2022`
+- Out-of-sample test: `2023-2025`
+
+Walk-forward loop (monthly by default, configurable):
+
+- Re-estimate hedge ratio
+- Re-estimate OU parameters
+- Retest cointegration stability (already embedded in step3 gating)
+- Trade the next period only
+
+Transaction costs are explicit and configurable in `config.py`:
+
+- Per-leg trading cost in bps
+- Per-leg slippage proxy in bps
+- Turnover penalty in bps
+
+Default assumption is `7 bps` trading + `3 bps` slippage + `1 bps` turnover
+penalty, which is in the requested 5-10 bps per-leg range.
+
+```bash
+python main.py step4              # first default pair
+python main.py step4 XOM CVX      # explicit pair
+```
+
+## Plot Reports
+
+Generate all plots:
+
+```bash
+python main.py plots
+```
+
+Each run is archived in `reports/runs/<timestamp>/` and mirrored to
+`reports/latest/` (latest run only).
+
+### GLD/SLV Lead Case Study
+
+![GLD/SLV Spread](reports/latest/gld_slv_lead_case_spread.png)
+![GLD/SLV Z-Score](reports/latest/gld_slv_lead_case_zscore.png)
+![GLD/SLV Entries and Exits](reports/latest/gld_slv_lead_case_entries_exits.png)
+![GLD/SLV Equity Curve](reports/latest/gld_slv_lead_case_equity_curve.png)
+
+### XOM/CVX Negative Example
+
+![XOM/CVX Spread](reports/latest/xom_cvx_negative_case_spread.png)
+![XOM/CVX Z-Score](reports/latest/xom_cvx_negative_case_zscore.png)
+![XOM/CVX Entries and Exits](reports/latest/xom_cvx_negative_case_entries_exits.png)
+![XOM/CVX Equity Curve](reports/latest/xom_cvx_negative_case_equity_curve.png)
+
+### Pair Comparisons
+
+![Cumulative Net Return by Pair](reports/latest/comparison_cumulative_net_by_pair.png)
+![Gross vs Net Return by Pair](reports/latest/comparison_gross_vs_net_by_pair.png)

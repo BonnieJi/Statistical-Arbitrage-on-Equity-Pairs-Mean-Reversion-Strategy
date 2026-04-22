@@ -11,6 +11,18 @@ from src.hedge_ratio import ols_hedge_ratio, rolling_hedge_ratio
 from src.ou_model import rolling_ou_params
 
 
+def _resolve_strategy_params(strategy_params: dict | None = None) -> dict:
+    p = strategy_params or {}
+    return {
+        "z_entry": float(p.get("z_entry", cfg.Z_ENTRY)),
+        "z_exit": float(p.get("z_exit", cfg.Z_EXIT)),
+        "z_stop": float(p.get("z_stop", cfg.Z_STOP)),
+        "coint_p_max": float(p.get("coint_p_max", cfg.DEFAULT_COINT_P_MAX)),
+        "half_life_min": float(p.get("half_life_min", cfg.DEFAULT_HALF_LIFE_MIN_DAYS)),
+        "half_life_max": float(p.get("half_life_max", cfg.DEFAULT_HALF_LIFE_MAX_DAYS)),
+    }
+
+
 def rolling_engle_granger_pvalue(
     log_p1: pd.Series,
     log_p2: pd.Series,
@@ -63,7 +75,9 @@ def build_pair_feature_panel(
     volumes: pd.DataFrame,
     symbol_1: str,
     symbol_2: str,
+    strategy_params: dict | None = None,
 ) -> pd.DataFrame:
+    params = _resolve_strategy_params(strategy_params)
     """Per-day features: logs, rolling hedge, spread, z, OU, filters (no positions)."""
     px = prices[[symbol_1, symbol_2]].sort_index().astype(float)
     vol = volumes.reindex(px.index)[[symbol_1, symbol_2]].astype(float)
@@ -111,31 +125,42 @@ def build_pair_feature_panel(
     df["spread_slope_tstat"] = rolling_slope_tstat(df["spread"], cfg.SPREAD_SLOPE_WINDOW)
 
     # --- Gates used at entry (subset of features; rest available for research) ---
-    df["gate_coint_stable"] = df["rolling_eg_pvalue"] < cfg.DEFAULT_COINT_P_MAX
+    df["entry_gate_z"] = df["z_score"].abs() > params["z_entry"]
+    df["entry_gate_cointegration"] = df["rolling_eg_pvalue"] < params["coint_p_max"]
     hl = df["half_life_roll"]
-    df["gate_half_life"] = (hl >= cfg.DEFAULT_HALF_LIFE_MIN_DAYS) & (
-        hl <= cfg.DEFAULT_HALF_LIFE_MAX_DAYS
+    # OU fits can occasionally produce NaN half-life even when spread behavior is usable.
+    # Use last valid estimate as a conservative fallback before applying the half-life gate.
+    hl_effective = hl.ffill()
+    df["half_life_effective"] = hl_effective
+    df["entry_gate_half_life"] = (hl_effective >= params["half_life_min"]) & (
+        hl_effective <= params["half_life_max"]
     )
+    # Keep this permissive and transparent: trade only when spread vol is valid.
+    df["entry_gate_volatility"] = df["spread_vol_roll"].notna() & (df["spread_vol_roll"] > 0)
+
+    # Auxiliary diagnostics retained for research.
     df["gate_liquidity"] = df["dollar_volume_min"] >= cfg.DEFAULT_MIN_DOLLAR_VOLUME_USD
     ci = df["corr_instability"]
     df["gate_corr_stable"] = ci <= cfg.MAX_CORR_INSTABILITY_STD
     st = df["spread_slope_tstat"]
     df["gate_spread_not_trending"] = st.abs() <= cfg.SPREAD_SLOPE_MAX_ABS_TSTAT
 
-    df["entry_gate_all"] = (
-        df["gate_coint_stable"].fillna(False)
-        & df["gate_half_life"].fillna(False)
-        & df["gate_liquidity"].fillna(False)
-        & df["gate_corr_stable"].fillna(False)
-        & df["gate_spread_not_trending"].fillna(False)
+    # Non-z entry gate used by the state machine.
+    df["entry_gate_non_z"] = (
+        df["entry_gate_cointegration"].fillna(False)
+        & df["entry_gate_half_life"].fillna(False)
+        & df["entry_gate_volatility"].fillna(False)
     )
+    df["entry_gate_all"] = df["entry_gate_non_z"] & df["entry_gate_z"].fillna(False)
 
     df.attrs["symbol_1"] = symbol_1
     df.attrs["symbol_2"] = symbol_2
+    df.attrs["strategy_params"] = params
     return df
 
 
-def simulate_positions(df: pd.DataFrame) -> pd.DataFrame:
+def simulate_positions(df: pd.DataFrame, strategy_params: dict | None = None) -> pd.DataFrame:
+    params = _resolve_strategy_params(strategy_params if strategy_params is not None else df.attrs.get("strategy_params"))
     """State machine: entry |z|>2 with gates, exit |z|<0.5 or stop |z|>3.5 or max hold.
 
     Continuous sizing: min(|z|/Z_SIZE_REF, 1) * TARGET_SPREAD_DAILY_VOL / spread_vol,
@@ -143,43 +168,53 @@ def simulate_positions(df: pd.DataFrame) -> pd.DataFrame:
     """
     out = df.copy()
     z = out["z_score"].to_numpy(dtype=float)
-    entry_ok = out["entry_gate_all"].to_numpy()
+    entry_non_z = out["entry_gate_non_z"].to_numpy()
     vol_spread = out["spread_vol_roll"].to_numpy(dtype=float)
     n = len(out)
     pos = np.zeros(n, dtype=float)
+    entry_event = np.zeros(n, dtype=bool)
+    exit_event = np.zeros(n, dtype=bool)
+    trade_id = np.zeros(n, dtype=int)
     flat = True
     direction = 0  # +1 long spread, -1 short spread
     entry_idx = -1
+    current_trade_id = 0
 
     for i in range(n):
         z_i = z[i]
         if flat:
-            if entry_ok[i] and np.isfinite(z_i):
-                if z_i > cfg.Z_ENTRY:
+            if entry_non_z[i] and np.isfinite(z_i):
+                if z_i > params["z_entry"]:
                     flat = False
                     direction = -1
                     entry_idx = i
-                elif z_i < -cfg.Z_ENTRY:
+                    current_trade_id += 1
+                    entry_event[i] = True
+                elif z_i < -params["z_entry"]:
                     flat = False
                     direction = 1
                     entry_idx = i
+                    current_trade_id += 1
+                    entry_event[i] = True
         else:
             exit_now = False
             if not np.isfinite(z_i):
                 exit_now = True
-            elif abs(z_i) < cfg.Z_EXIT:
+            elif abs(z_i) < params["z_exit"]:
                 exit_now = True
-            elif abs(z_i) > cfg.Z_STOP:
+            elif abs(z_i) > params["z_stop"]:
                 exit_now = True
             elif entry_idx >= 0 and (i - entry_idx + 1) >= cfg.MAX_HOLDING_DAYS:
                 exit_now = True
             if exit_now:
+                exit_event[i] = True
                 flat = True
                 direction = 0
                 entry_idx = -1
 
         if flat:
             pos[i] = 0.0
+            trade_id[i] = 0
         else:
             mag = min(abs(z_i) / cfg.Z_SIZE_REF, 1.0)
             v = vol_spread[i] if np.isfinite(vol_spread[i]) else np.nan
@@ -191,9 +226,23 @@ def simulate_positions(df: pd.DataFrame) -> pd.DataFrame:
             cap = min(cfg.DEFAULT_MAX_CAPITAL_PER_PAIR, cfg.DEFAULT_MAX_GROSS_LEVERAGE)
             raw = float(np.clip(raw, -cap, cap))
             pos[i] = raw
+            trade_id[i] = current_trade_id
 
     out["position"] = pos
     out["position_gross"] = np.abs(pos)
+    out["entry_event"] = entry_event
+    out["exit_event"] = exit_event
+    out["trade_id"] = trade_id
+    out["completed_trades"] = int(exit_event.sum())
+    out.attrs["gate_counts"] = {
+        "days_z_abs_gt_entry": int(out["entry_gate_z"].fillna(False).sum()),
+        "days_rolling_eg_p_lt_thresh": int(out["entry_gate_cointegration"].fillna(False).sum()),
+        "days_half_life_in_range": int(out["entry_gate_half_life"].fillna(False).sum()),
+        "days_volatility_gate_true": int(out["entry_gate_volatility"].fillna(False).sum()),
+        "days_entry_gate_all_true": int(out["entry_gate_all"].fillna(False).sum()),
+        "non_zero_position_days": int((out["position"].abs() > 1e-12).sum()),
+        "completed_trades": int(exit_event.sum()),
+    }
     return out
 
 
@@ -202,7 +251,8 @@ def generate_signals_for_pair(
     volumes: pd.DataFrame,
     symbol_1: str,
     symbol_2: str,
+    strategy_params: dict | None = None,
 ) -> pd.DataFrame:
     """Full Step 3 pipeline for one pair: features + positions."""
-    feats = build_pair_feature_panel(prices, volumes, symbol_1, symbol_2)
-    return simulate_positions(feats)
+    feats = build_pair_feature_panel(prices, volumes, symbol_1, symbol_2, strategy_params=strategy_params)
+    return simulate_positions(feats, strategy_params=strategy_params)
