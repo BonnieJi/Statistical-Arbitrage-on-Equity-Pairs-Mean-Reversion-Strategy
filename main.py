@@ -10,10 +10,23 @@ import shutil
 import pandas as pd
 
 from config import DEFAULT_END_DATE, DEFAULT_PAIRS, DEFAULT_START_DATE
-from src.backtest import run_walk_forward_backtest_for_pair, split_period_performance, summarize_trades
+from src.backtest import (
+    build_equal_risk_portfolio,
+    run_sensitivity_analysis,
+    run_walk_forward_backtest_for_pair,
+    split_period_performance,
+    summarize_trades,
+)
 from src.data_loader import fetch_adjusted_close, fetch_adjusted_close_and_volume
+from src.metrics import max_drawdown, summarize_trade_distribution
 from src.pair_selection import rank_candidate_pairs
-from src.plots import plot_case_study, plot_pair_comparisons
+from src.plots import (
+    plot_case_study,
+    plot_pair_comparisons,
+    plot_portfolio_equity,
+    plot_sensitivity_curves,
+    plot_trade_distribution,
+)
 from src.signals import generate_signals_for_pair
 
 
@@ -141,6 +154,7 @@ if __name__ == "__main__":
         written: list[str] = []
         # Lead case study (strongest OOS performer in current runs): GLD/SLV.
         if "GLD/SLV" in pair_daily:
+            gld_trades = summarize_trades(pair_daily["GLD/SLV"])
             written.extend(
                 plot_case_study(
                     pair_daily["GLD/SLV"],
@@ -149,6 +163,23 @@ if __name__ == "__main__":
                     filename_prefix="gld_slv_lead_case",
                 )
             )
+            written.extend(
+                plot_trade_distribution(
+                    gld_trades,
+                    pair_name="GLD/SLV (Lead Case)",
+                    out_dir=out_dir,
+                    filename_prefix="gld_slv_lead_case",
+                )
+            )
+            td = summarize_trade_distribution(gld_trades)
+            print(
+                "\nGLD/SLV trade distribution stats:\n"
+                f"n_trades={int(td['n_trades'])}, win_rate={td['win_rate']:.2%}, "
+                f"avg_win={td['avg_win']:.6f}, avg_loss={td['avg_loss']:.6f}, "
+                f"avg_holding_days={td['avg_holding_days']:.2f}"
+            )
+            if not pair_daily["GLD/SLV"].empty:
+                print(f"GLD/SLV max drawdown: {max_drawdown(pair_daily['GLD/SLV']['cum_net']):.6f}")
         # Negative example: XOM/CVX.
         if "XOM/CVX" in pair_daily:
             written.extend(
@@ -160,6 +191,16 @@ if __name__ == "__main__":
                 )
             )
         written.extend(plot_pair_comparisons(pair_daily, out_dir=out_dir))
+        # Sensitivity analysis on lead pair.
+        sens = run_sensitivity_analysis("GLD", "SLV")
+        written.extend(plot_sensitivity_curves(sens, out_dir=out_dir, filename_prefix="gld_slv"))
+        # Portfolio-level aggregation over all pairs.
+        portfolio = build_equal_risk_portfolio(pair_daily, max_leverage=1.5)
+        written.extend(plot_portfolio_equity(portfolio, out_dir=out_dir, filename_prefix="multi_pair"))
+        if not portfolio.empty:
+            port_sharpe = (portfolio["pnl_net"].mean() / (portfolio["pnl_net"].std() + 1e-12)) * (252**0.5)
+            print(f"Portfolio Sharpe (daily, annualized): {port_sharpe:.3f}")
+            print(f"Portfolio max drawdown: {max_drawdown(portfolio['cum_net']):.6f}")
 
         # Mirror most recent run into a stable folder for easy access.
         if latest_dir.exists():

@@ -114,3 +114,40 @@ Each run is archived in `reports/runs/<timestamp>/` and mirrored to
 
 ![Cumulative Net Return by Pair](reports/latest/comparison_cumulative_net_by_pair.png)
 ![Gross vs Net Return by Pair](reports/latest/comparison_gross_vs_net_by_pair.png)
+
+## Risk & Distribution Upgrades
+
+- Drawdown-aware reporting: max drawdown, rolling Sharpe (60d), and equity+drawdown charts.
+- Trade distribution diagnostics: trade PnL histogram, holding-period histogram, win-rate stats.
+- Sensitivity sweeps (research robustness):
+  - entry threshold (`1.0 -> 2.5`)
+  - exit threshold (`0.0 -> 1.0`)
+  - cointegration p-value threshold
+  - half-life cutoff
+
+Generated plots include:
+
+- `reports/latest/gld_slv_lead_case_rolling_sharpe_60d.png`
+- `reports/latest/gld_slv_lead_case_trade_pnl_hist.png`
+- `reports/latest/gld_slv_lead_case_holding_period_hist.png`
+- `reports/latest/gld_slv_sensitivity_sharpe.png`
+- `reports/latest/gld_slv_sensitivity_net_return.png`
+- `reports/latest/multi_pair_portfolio_equity_curve.png`
+
+## Portfolio-Level Strategy
+
+Pairs are now combined using inverse-volatility weights with leverage cap
+(`max_leverage=1.5` in plotting mode) to produce a portfolio equity curve and
+portfolio Sharpe.
+
+## Link to Market Making
+
+Conceptual bridge to execution/microstructure:
+
+- When spread z-score is high (`z > entry`), inventory/quote skew can be biased
+  toward selling pressure (downward quote skew).
+- When spread z-score is low (`z < -entry`), skew can be biased toward buying
+  pressure (upward quote skew).
+
+This ties medium-horizon stat-arb alpha to short-horizon market-making quote
+placement.

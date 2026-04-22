@@ -8,6 +8,7 @@ import pandas as pd
 import config as cfg
 from src.data_loader import fetch_adjusted_close_and_volume
 from src.hedge_ratio import ols_hedge_ratio
+from src.metrics import rolling_sharpe
 from src.ou_model import ou_params_from_spread
 from src.signals import generate_signals_for_pair
 
@@ -35,7 +36,11 @@ def _cost_from_turnover(leg1_change: pd.Series, leg2_change: pd.Series) -> pd.Se
     return per_leg_total * turnover + turnover_penalty * turnover
 
 
-def run_walk_forward_backtest_for_pair(symbol_1: str, symbol_2: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def run_walk_forward_backtest_for_pair(
+    symbol_1: str,
+    symbol_2: str,
+    strategy_params: dict | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run monthly/quarterly walk-forward using 2018-2021 train, 2022 validation, 2023-2025 OOS test.
 
     Every rebalance period:
@@ -49,7 +54,7 @@ def run_walk_forward_backtest_for_pair(symbol_1: str, symbol_2: str) -> tuple[pd
         start_date=cfg.TRAIN_START,
         end_date=None,
     )
-    panel = generate_signals_for_pair(prices, volumes, symbol_1, symbol_2)
+    panel = generate_signals_for_pair(prices, volumes, symbol_1, symbol_2, strategy_params=strategy_params)
     panel = panel.copy()
     panel["ret_1"] = panel["log_p1"].diff().fillna(0.0)
     panel["ret_2"] = panel["log_p2"].diff().fillna(0.0)
@@ -122,8 +127,58 @@ def run_walk_forward_backtest_for_pair(symbol_1: str, symbol_2: str) -> tuple[pd
     daily = pd.concat(out_rows).sort_index()
     daily["cum_gross"] = daily["pnl_gross"].cumsum()
     daily["cum_net"] = daily["pnl_net"].cumsum()
+    daily["rolling_sharpe_60d"] = rolling_sharpe(daily["pnl_net"], window=60)
     summary = pd.DataFrame(summary_rows)
     return daily, summary
+
+
+def run_sensitivity_analysis(symbol_1: str, symbol_2: str) -> pd.DataFrame:
+    """One-factor sweeps for core signal parameters."""
+    rows: list[dict] = []
+    sweep_defs = [
+        ("z_entry", [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5]),
+        ("z_exit", [0.0, 0.25, 0.5, 0.75, 1.0]),
+        ("coint_p_max", [0.05, 0.10, 0.15, 0.20]),
+        ("half_life_max", [45.0, 60.0, 90.0, 120.0]),
+    ]
+    for param_name, values in sweep_defs:
+        for value in values:
+            p = {param_name: value}
+            daily, _ = run_walk_forward_backtest_for_pair(symbol_1, symbol_2, strategy_params=p)
+            if daily.empty:
+                continue
+            ret = daily["pnl_net"]
+            sharpe = float((ret.mean() / (ret.std() + 1e-12)) * np.sqrt(252))
+            rows.append(
+                {
+                    "pair": f"{symbol_1}/{symbol_2}",
+                    "parameter": param_name,
+                    "value": float(value),
+                    "net_return": float(ret.sum()),
+                    "sharpe": sharpe,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_equal_risk_portfolio(pair_dailies: dict[str, pd.DataFrame], max_leverage: float = 1.5) -> pd.DataFrame:
+    """Combine pairs with inverse-vol risk weights and leverage cap."""
+    non_empty = {k: v for k, v in pair_dailies.items() if not v.empty}
+    if not non_empty:
+        return pd.DataFrame()
+    net = pd.concat({k: v["pnl_net"] for k, v in non_empty.items()}, axis=1).fillna(0.0)
+    vol = net.rolling(20, min_periods=10).std().replace(0.0, np.nan)
+    inv_vol = 1.0 / vol
+    w = inv_vol.div(inv_vol.sum(axis=1), axis=0).fillna(0.0)
+    gross_w = w.abs().sum(axis=1)
+    scale = np.minimum(1.0, max_leverage / (gross_w + 1e-12))
+    w_scaled = w.mul(scale, axis=0)
+    port = pd.DataFrame(index=net.index)
+    port["pnl_net"] = (w_scaled * net).sum(axis=1)
+    port["cum_net"] = port["pnl_net"].cumsum()
+    port["rolling_sharpe_60d"] = rolling_sharpe(port["pnl_net"], window=60)
+    port["gross_leverage"] = w_scaled.abs().sum(axis=1)
+    return port
 
 
 def summarize_trades(daily: pd.DataFrame) -> pd.DataFrame:
